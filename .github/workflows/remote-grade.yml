@@ -1,0 +1,140 @@
+name: Remote grade (tiny-chess-01)
+
+# Manual only. This competition makes no model calls, so no API key or
+# repository secret is used or required anywhere in this workflow.
+on:
+  workflow_dispatch:
+    inputs:
+      instances:
+        description: "Practice instances to grade (1 or 3)"
+        required: true
+        default: "1"
+        type: choice
+        options:
+          - "1"
+          - "3"
+
+permissions:
+  contents: read
+
+jobs:
+  grade:
+    name: grade-local on Docker (${{ inputs.instances }} instance(s))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    env:
+      RUN_DIR: runs/${{ github.run_id }}-${{ github.run_attempt }}-i${{ inputs.instances }}
+    steps:
+      - name: Check out the testing repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js 22.23.5
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22.23.5"
+          package-manager-cache: false
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Verify Node, Python and Docker versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --version
+          python3 --version
+          docker --version
+
+          test "$(node --version)" = "v22.23.5"
+          python3 - <<'PY'
+          import sys
+          assert sys.version_info[:2] == (3, 13), sys.version
+          print("Python", sys.version.split()[0], "OK")
+          PY
+
+      - name: Verify Docker is running
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker info
+
+      - name: Prepare unique run directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUN_DIR"
+          {
+            echo "node=$(node --version)"
+            echo "python=$(python3 --version)"
+            echo "docker=$(docker --version)"
+            echo "commit=$(git rev-parse HEAD)"
+            echo "instances=${{ inputs.instances }}"
+            echo "run_id=${{ github.run_id }}"
+            echo "run_attempt=${{ github.run_attempt }}"
+          } | tee "$RUN_DIR/environment.txt"
+
+      - name: Make.fun CLI version
+        shell: bash
+        run: |
+          set -euo pipefail
+          node cli/makefun.mjs version 2>&1 | tee "$RUN_DIR/cli-version.log"
+
+      - name: Verify practice instances (official, Docker driver)
+        shell: bash
+        run: |
+          set -euo pipefail
+          node cli/makefun.mjs verify-instance --kit . --driver docker 2>&1 \
+            | tee "$RUN_DIR/verify-instance.log"
+
+      - name: Run official grade-local (live trial plus replay)
+        id: grade
+        continue-on-error: true
+        timeout-minutes: 300
+        shell: bash
+        env:
+          INSTANCES: ${{ inputs.instances }}
+        run: |
+          set -uo pipefail
+          case "$INSTANCES" in
+            1|3) ;;
+            *)
+              echo "::error::instances must be 1 or 3"
+              exit 2
+              ;;
+          esac
+
+          args=(grade-local --kit . --bot bot --driver docker --save "$RUN_DIR/trials")
+          if [ "$INSTANCES" -eq 3 ]; then
+            args+=(--instances 3)
+          fi
+
+          node cli/makefun.mjs "${args[@]}" 2>&1 | tee "$RUN_DIR/grade.log"
+          status=${PIPESTATUS[0]}
+          printf '%s\n' "$status" | tee "$RUN_DIR/grade.exit-code"
+          exit "$status"
+
+      - name: Upload grading results and cassettes
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: tiny-chess-grade-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.instances }}
+          path: runs/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Enforce grading result
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f "$RUN_DIR/grade.exit-code" ]; then
+            echo "::error::grade-local did not run or did not record an exit code"
+            exit 1
+          fi
+          status="$(cat "$RUN_DIR/grade.exit-code")"
+          echo "grade-local exit code: $status"
+          test "$status" -eq 0
